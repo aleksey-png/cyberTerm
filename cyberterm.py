@@ -4,6 +4,9 @@ import sys
 import subprocess
 import threading
 import re
+import select
+import signal
+import time
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -22,7 +25,7 @@ class TerminalTab:
         else:
             self.home_dir = os.path.expanduser("~")
         self.current_dir = self.home_dir
-        
+
         self.sudo_password = None
 
         self.command_history = []
@@ -30,6 +33,10 @@ class TerminalTab:
         self.current_process = None
         self.process_running = False
         self.process_lock = threading.Lock()
+        self.stop_requested = threading.Event()
+        self.is_closing = False
+        self.user_scrolled = False
+        self.scroll_check_after_id = None
 
         self.frame = ttk.Frame(notebook)
         self.tab_id = notebook.add(self.frame, text=f"💻 {name}")
@@ -45,14 +52,14 @@ class TerminalTab:
         self.dir_label.pack(side=tk.LEFT, padx=10)
 
         self.stop_button = tk.Button(
-            self.top_bar, text="⏹️ STOP", command=self.stop_current_process,
+            self.top_bar, text="⏹ STOP", command=self.stop_current_process,
             bg='#5A2A2A', fg='#FF4444', font=('Arial', 9, 'bold'),
             relief=tk.FLAT, padx=15, pady=3, state=tk.DISABLED, cursor="hand2"
         )
         self.stop_button.pack(side=tk.RIGHT, padx=10)
 
         self.clear_button = tk.Button(
-            self.top_bar, text="🗑️ CLEAR", command=self.clear_screen,
+            self.top_bar, text="🗑 CLEAR", command=self.clear_screen,
             bg='#2A2A2A', fg='#AAAAAA', font=('Arial', 9),
             relief=tk.FLAT, padx=15, pady=3, cursor="hand2"
         )
@@ -70,7 +77,7 @@ class TerminalTab:
         self.output_text = tk.Text(
             text_frame, bg='#0C0C0C', fg='#00FF00', insertbackground='#00FF00',
             font=('Consolas', 10), wrap=tk.NONE, relief=tk.FLAT, padx=10, pady=10,
-            yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set,
+            yscrollcommand=self.on_scroll, xscrollcommand=h_scrollbar.set,
             selectbackground='#335533', selectforeground='#00FF00'
         )
         self.output_text.pack(fill=tk.BOTH, expand=True)
@@ -86,6 +93,10 @@ class TerminalTab:
 
         self.output_text.bind('<Control-c>', self.copy_selection)
         self.output_text.bind('<Control-C>', self.copy_selection)
+        self.output_text.bind('<Button-4>', self.on_mousewheel_up)
+        self.output_text.bind('<Button-5>', self.on_mousewheel_down)
+        self.output_text.bind('<Button-1>', self.on_user_click)
+        self.output_text.bind('<Key>', self.on_user_key)
 
         input_frame = tk.Frame(self.frame, bg='#0C0C0C', height=40)
         input_frame.pack(fill=tk.X, side=tk.BOTTOM)
@@ -109,16 +120,64 @@ class TerminalTab:
         self.input_entry.bind('<Down>', self.next_command)
 
         self.add_output(f"\n{'='*70}\n", 'info')
-        self.add_output(f"🔥 CyberTerm v5.2 - {name}\n", 'success')
+        self.add_output(f"🔥 CyberTerm v6.0 - {name}\n", 'success')
         self.add_output(f"📂 {self.current_dir}\n", 'info')
         self.add_output(f"👤 {self.real_user}\n", 'info')
         self.add_output(f"{'='*70}\n", 'info')
-        self.add_output("✅ Команды: help, clear, pwd, ls, cd, edit, exit\n")
-        self.add_output("✅ sudo <команда> - запуск с правами root (пароль запоминается)\n")
-        self.add_output("✅ edit <файл> - встроенный редактор\n")
-        self.add_output("💡 Закрыть вкладку: ПКМ\n\n")
+        self.add_output("✅ Commands: help, clear, pwd, ls, cd, edit, exit\n")
+        self.add_output("✅ sudo <command> - run with root privileges\n")
+        self.add_output("✅ edit <file> - built-in text editor\n")
+        self.add_output("💡 Right click on tab to close\n")
+        self.add_output("💡 STOP button terminates running process\n\n")
 
         self.print_prompt()
+
+    def on_scroll(self, *args):
+        self.output_text.yview_moveto(args[0])
+        self.check_user_scroll()
+
+    def on_mousewheel_up(self, event):
+        self.user_scrolled = True
+        self.cancel_scroll_check()
+
+    def on_mousewheel_down(self, event):
+        self.output_text.yview_scroll(1, "units")
+        self.check_user_scroll()
+
+    def on_user_click(self, event):
+        self.schedule_scroll_check()
+
+    def on_user_key(self, event):
+        if event.keysym in ('Up', 'Down', 'Prior', 'Next', 'Home', 'End'):
+            self.user_scrolled = True
+            self.cancel_scroll_check()
+        else:
+            self.schedule_scroll_check()
+
+    def schedule_scroll_check(self):
+        if self.scroll_check_after_id:
+            self.output_text.after_cancel(self.scroll_check_after_id)
+        self.scroll_check_after_id = self.output_text.after(100, self.check_user_scroll)
+
+    def cancel_scroll_check(self):
+        if self.scroll_check_after_id:
+            self.output_text.after_cancel(self.scroll_check_after_id)
+            self.scroll_check_after_id = None
+
+    def check_user_scroll(self):
+        if not self.process_running:
+            self.user_scrolled = False
+            return
+
+        try:
+            yview = self.output_text.yview()
+            bottom_pos = yview[1]
+            if bottom_pos >= 0.99:
+                self.user_scrolled = False
+            else:
+                self.user_scrolled = True
+        except:
+            self.user_scrolled = False
 
     def _get_real_user(self):
         try:
@@ -138,135 +197,236 @@ class TerminalTab:
         if display_path.startswith(self.home_dir):
             display_path = "~" + display_path[len(self.home_dir):]
         if self.process_running:
-            return f"[ПРОЦЕСС] {display_path} $ "
+            return f"[PROCESS] {display_path} $ "
         return f"{display_path} $ "
 
     def update_prompt(self):
-        self.prompt_label.config(text=self.get_prompt_text())
+        try:
+            self.prompt_label.config(text=self.get_prompt_text())
+        except:
+            pass
 
     def update_directory_display(self):
-        display_path = self.current_dir
-        if display_path.startswith(self.home_dir):
-            display_path = "~" + display_path[len(self.home_dir):]
-        self.dir_label.config(text=f"📁 {display_path}")
+        try:
+            display_path = self.current_dir
+            if display_path.startswith(self.home_dir):
+                display_path = "~" + display_path[len(self.home_dir):]
+            self.dir_label.config(text=f"📁 {display_path}")
+        except:
+            pass
 
     def add_output(self, text, tag=None):
         def _add():
-            self.output_text.config(state=tk.NORMAL)
-            clean_text = re.sub(r'\x1b\[[0-9;]*[mK]', '', text)
-            if tag:
-                self.output_text.insert(tk.END, clean_text, tag)
-            else:
-                self.output_text.insert(tk.END, clean_text)
-            self.output_text.see(tk.END)
-            self.output_text.config(state=tk.DISABLED)
+            try:
+                if not self.output_text.winfo_exists():
+                    return
+                self.output_text.config(state=tk.NORMAL)
+                clean_text = re.sub(r'\x1b\[[0-9;]*[mK]', '', text)
+                if tag:
+                    self.output_text.insert(tk.END, clean_text, tag)
+                else:
+                    self.output_text.insert(tk.END, clean_text)
+                
+                if not self.user_scrolled:
+                    self.output_text.see(tk.END)
+                    
+                self.output_text.config(state=tk.DISABLED)
+            except:
+                pass
 
-        if threading.current_thread() != threading.main_thread():
-            self.output_text.after(0, _add)
-        else:
+        if threading.current_thread() is threading.main_thread():
             _add()
+        else:
+            try:
+                if hasattr(self, 'output_text') and self.output_text.winfo_exists():
+                    self.output_text.after(0, _add)
+            except:
+                pass
 
     def print_prompt(self):
         self.add_output(f"\n{self.get_prompt_text()}", 'prompt')
+        try:
+            if not self.user_scrolled:
+                self.output_text.after(10, lambda: self.output_text.see(tk.END))
+        except:
+            pass
 
     def copy_selection(self, event=None):
         try:
             selected = self.output_text.get(tk.SEL_FIRST, tk.SEL_LAST)
             self.output_text.clipboard_clear()
             self.output_text.clipboard_append(selected)
-            self.output_text.update()
-        except tk.TclError:
+        except:
             pass
         return 'break'
 
     def clear_screen(self):
-        self.output_text.config(state=tk.NORMAL)
-        self.output_text.delete(1.0, tk.END)
-        self.output_text.config(state=tk.DISABLED)
-        self.print_prompt()
+        try:
+            self.output_text.config(state=tk.NORMAL)
+            self.output_text.delete(1.0, tk.END)
+            self.output_text.config(state=tk.DISABLED)
+            self.user_scrolled = False
+            self.print_prompt()
+        except:
+            pass
 
     def stop_current_process(self):
         with self.process_lock:
-            if self.current_process is not None:
-                try:
-                    self.add_output("\n⚠️ Остановка процесса...\n", 'warning')
-                    self.current_process.terminate()
-                    try:
-                        self.current_process.wait(timeout=2)
-                        self.add_output("✅ Процесс остановлен\n", 'success')
-                    except subprocess.TimeoutExpired:
-                        self.current_process.kill()
-                        self.current_process.wait()
-                        self.add_output("✅ Процесс принудительно остановлен\n", 'success')
-                except Exception as e:
-                    self.add_output(f"❌ Ошибка: {e}\n", 'error')
-                finally:
-                    self.process_running = False
-                    self.current_process = None
-                    self.stop_button.config(state=tk.DISABLED)
-                    self.update_prompt()
-
-    def run_with_sudo(self, command):
-        if self.sudo_password is None:
-            password = simpledialog.askstring("sudo", f"Введите пароль для {self.real_user}:", show='*', parent=self.notebook)
-            if not password:
-                self.add_output("\n❌ sudo: пароль не введён\n", 'error')
+            if not self.process_running or self.current_process is None:
                 return
-            self.sudo_password = password
-            self.add_output("\n🔑 Пароль сохранён для этой сессии\n", 'success')
+            self.stop_requested.set()
+            process = self.current_process
+            self.process_running = False
+
+        if process is None:
+            return
+
+        self.add_output(f"\n^C\n", 'prompt')
         
-        full_cmd = f"echo '{self.sudo_password}' | sudo -S {command}"
-        
-        def target():
-            with self.process_lock:
+        def kill_process():
+            try:
+                pid = process.pid
                 try:
-                    self.process_running = True
-                    self.current_process = subprocess.Popen(
-                        full_cmd, shell=True, stdin=subprocess.PIPE,
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, cwd=self.current_dir, bufsize=1
-                    )
-                    self.stop_button.config(state=tk.NORMAL)
-                    self.update_prompt()
-
-                    while self.process_running:
-                        if self.current_process.poll() is not None:
-                            break
-                        try:
-                            char = self.current_process.stdout.read(1)
-                            if char:
-                                self.add_output(char)
-                            else:
-                                break
-                        except:
-                            break
-
+                    pgid = os.getpgid(pid)
+                    os.killpg(pgid, signal.SIGINT)
+                except:
                     try:
-                        remaining = self.current_process.stdout.read()
-                        if remaining:
-                            self.add_output(remaining)
+                        os.kill(pid, signal.SIGINT)
                     except:
                         pass
 
-                    self.current_process.wait()
-                    
-                    if self.current_process.returncode != 0:
-                        self.sudo_password = None
-                        self.add_output("\n⚠️ Пароль неверный. При следующей sudo запросит заново.\n", 'warning')
+                time.sleep(0.5)
+                
+                if process.poll() is not None:
+                    self.add_output("✅ Process terminated (SIGINT)\n", 'success')
+                    return
 
-                except Exception as e:
-                    self.add_output(f"\n❌ Ошибка: {e}\n", 'error')
-                finally:
-                    self.process_running = False
+                try:
+                    pgid = os.getpgid(pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                except:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except:
+                        pass
+
+                time.sleep(0.3)
+                
+                if process.poll() is not None:
+                    self.add_output("✅ Process terminated (SIGTERM)\n", 'success')
+                    return
+
+                try:
+                    pgid = os.getpgid(pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except:
+                        pass
+
+                self.add_output("✅ Process killed (SIGKILL)\n", 'success')
+                
+            except:
+                pass
+            finally:
+                def cleanup():
+                    try:
+                        with self.process_lock:
+                            self.current_process = None
+                        self.user_scrolled = False
+                        self.stop_button.config(state=tk.DISABLED)
+                        self.update_prompt()
+                        self.print_prompt()
+                    except:
+                        pass
+                
+                try:
+                    self.output_text.after(0, cleanup)
+                except:
+                    pass
+
+        thread = threading.Thread(target=kill_process, daemon=True)
+        thread.start()
+
+        try:
+            self.stop_button.config(state=tk.DISABLED)
+            self.update_prompt()
+        except:
+            pass
+
+    def run_with_sudo(self, command):
+        if self.sudo_password is None:
+            password = simpledialog.askstring("sudo", f"Password for {self.real_user}:", show='*', parent=self.notebook)
+            if not password:
+                self.add_output("\n❌ sudo: password required\n", 'error')
+                return
+            self.sudo_password = password
+            self.add_output("\n🔑 Password saved for this session\n", 'success')
+
+        full_cmd = f"echo '{self.sudo_password}' | sudo -S {command}"
+        self.stop_requested.clear()
+
+        def target():
+            process = None
+            try:
+                with self.process_lock:
+                    if self.stop_requested.is_set():
+                        return
+                    
+                    process = subprocess.Popen(
+                        full_cmd, shell=True, stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, cwd=self.current_dir, bufsize=1,
+                        preexec_fn=os.setsid
+                    )
+                    self.current_process = process
+                    self.process_running = True
+                    self.stop_button.config(state=tk.NORMAL)
+                    self.update_prompt()
+
+                while process.poll() is None and not self.stop_requested.is_set():
+                    try:
+                        rlist, _, _ = select.select([process.stdout], [], [], 0.1)
+                        if rlist:
+                            data = process.stdout.read(4096)
+                            if data:
+                                self.add_output(data)
+                    except:
+                        break
+
+                if self.stop_requested.is_set():
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except:
+                        try:
+                            process.kill()
+                        except:
+                            pass
+                    process.wait()
+
+            except Exception as e:
+                if not self.stop_requested.is_set():
+                    self.add_output(f"\n❌ Error: {e}\n", 'error')
+            finally:
+                with self.process_lock:
                     self.current_process = None
+                    self.process_running = False
+                try:
+                    self.user_scrolled = False
                     self.stop_button.config(state=tk.DISABLED)
                     self.update_prompt()
+                    if self.stop_requested.is_set():
+                        self.print_prompt()
+                except:
+                    pass
+                self.stop_requested.clear()
 
         threading.Thread(target=target, daemon=True).start()
 
     def open_editor(self, filename):
         if not filename:
-            filename = simpledialog.askstring("Редактор", "Имя файла:", parent=self.notebook)
+            filename = simpledialog.askstring("Editor", "File name:", parent=self.notebook)
             if not filename:
                 return
 
@@ -280,7 +440,7 @@ class TerminalTab:
                 pass
 
         editor_window = tk.Toplevel(self.notebook)
-        editor_window.title(f"Редактор: {filename}")
+        editor_window.title(f"Editor: {filename}")
         editor_window.geometry("800x600")
         editor_window.configure(bg='#0C0C0C')
         editor_window.transient(self.notebook)
@@ -294,7 +454,7 @@ class TerminalTab:
         text_area.insert(tk.END, content)
         text_area.focus_set()
 
-        info_label = tk.Label(editor_window, text=f"Редактирование: {full_path}",
+        info_label = tk.Label(editor_window, text=f"Editing: {full_path}",
                               bg='#1A1A1A', fg='#666666', anchor='w', padx=10)
         info_label.pack(fill=tk.X, side=tk.TOP)
 
@@ -307,21 +467,21 @@ class TerminalTab:
                 new_content = text_area.get(1.0, tk.END).rstrip('\n')
                 with open(full_path, 'w', encoding='utf-8') as f:
                     f.write(new_content)
-                info_label.config(text=f"✅ Сохранено: {full_path}", fg='#44FF44')
-                self.add_output(f"\n✅ Файл сохранён: {filename}\n", 'success')
-                editor_window.after(1500, lambda: info_label.config(text=f"Редактирование: {full_path}", fg='#666666'))
+                info_label.config(text=f"✅ Saved: {full_path}", fg='#44FF44')
+                self.add_output(f"\n✅ File saved: {filename}\n", 'success')
+                editor_window.after(1500, lambda: info_label.config(text=f"Editing: {full_path}", fg='#666666'))
             except Exception as e:
-                info_label.config(text=f"❌ Ошибка: {e}", fg='#FF4444')
+                info_label.config(text=f"❌ Error: {e}", fg='#FF4444')
 
         def close_editor():
             editor_window.destroy()
 
-        save_btn = tk.Button(button_frame, text="💾 СОХРАНИТЬ", command=save_file,
+        save_btn = tk.Button(button_frame, text="💾 SAVE", command=save_file,
                              bg='#2A5A2A', fg='#44FF44', font=('Arial', 10, 'bold'),
                              relief=tk.FLAT, padx=20, pady=8, cursor="hand2")
         save_btn.pack(side=tk.LEFT, padx=10)
 
-        close_btn = tk.Button(button_frame, text="✗ ЗАКРЫТЬ", command=close_editor,
+        close_btn = tk.Button(button_frame, text="✗ CLOSE", command=close_editor,
                               bg='#5A2A2A', fg='#FF4444', font=('Arial', 10, 'bold'),
                               relief=tk.FLAT, padx=20, pady=8, cursor="hand2")
         close_btn.pack(side=tk.RIGHT, padx=10)
@@ -341,8 +501,8 @@ class TerminalTab:
                 self.current_process.stdin.write(command + '\n')
                 self.current_process.stdin.flush()
                 self.add_output(command + '\n', 'prompt')
-            except Exception as e:
-                self.add_output(f"\n❌ {e}\n", 'error')
+            except:
+                self.add_output(f"\n❌ Cannot send input to process\n", 'error')
             self.input_entry.delete(0, tk.END)
             self.print_prompt()
             return
@@ -353,7 +513,7 @@ class TerminalTab:
 
         if command == 'help':
             self.add_output("Commands: help, clear, pwd, ls, cd, edit, exit\n", 'info')
-            self.add_output("  sudo <cmd> - запуск с правами root (пароль запоминается)\n", 'info')
+            self.add_output("  sudo <cmd> - run with root privileges\n", 'info')
         elif command == 'clear':
             self.clear_screen()
         elif command == 'pwd':
@@ -389,11 +549,11 @@ class TerminalTab:
                     files.append(f"📄 {item}")
 
             if dirs:
-                self.add_output("\n📂 ПАПКИ:\n", 'info')
+                self.add_output("\n📂 DIRECTORIES:\n", 'info')
                 for d in sorted(dirs):
                     self.add_output(f"  {d}\n")
             if files:
-                self.add_output("\n📃 ФАЙЛЫ:\n", 'info')
+                self.add_output("\n📃 FILES:\n", 'info')
                 for f in sorted(files):
                     self.add_output(f"  {f}\n")
         except Exception as e:
@@ -423,46 +583,62 @@ class TerminalTab:
             self.add_output(f"❌ {e}\n", 'error')
 
     def run_system_command(self, command):
+        self.stop_requested.clear()
+
         def target():
-            with self.process_lock:
-                try:
-                    self.process_running = True
-                    self.current_process = subprocess.Popen(
+            process = None
+            try:
+                with self.process_lock:
+                    if self.stop_requested.is_set():
+                        return
+                    
+                    process = subprocess.Popen(
                         command, shell=True, stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, cwd=self.current_dir, bufsize=1
+                        text=True, cwd=self.current_dir, bufsize=1,
+                        preexec_fn=os.setsid
                     )
+                    self.current_process = process
+                    self.process_running = True
                     self.stop_button.config(state=tk.NORMAL)
                     self.update_prompt()
 
-                    while self.process_running:
-                        if self.current_process.poll() is not None:
-                            break
-                        try:
-                            char = self.current_process.stdout.read(1)
-                            if char:
-                                self.add_output(char)
-                            else:
-                                break
-                        except:
-                            break
-
+                while process.poll() is None and not self.stop_requested.is_set():
                     try:
-                        remaining = self.current_process.stdout.read()
-                        if remaining:
-                            self.add_output(remaining)
+                        rlist, _, _ = select.select([process.stdout], [], [], 0.1)
+                        if rlist:
+                            data = process.stdout.read(4096)
+                            if data:
+                                self.add_output(data)
                     except:
-                        pass
+                        break
 
-                    self.current_process.wait()
+                if self.stop_requested.is_set():
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except:
+                        try:
+                            process.kill()
+                        except:
+                            pass
+                    process.wait()
 
-                except Exception as e:
-                    self.add_output(f"\n❌ {e}\n", 'error')
-                finally:
-                    self.process_running = False
+            except Exception as e:
+                if not self.stop_requested.is_set():
+                    self.add_output(f"\n❌ Error: {e}\n", 'error')
+            finally:
+                with self.process_lock:
                     self.current_process = None
+                    self.process_running = False
+                try:
+                    self.user_scrolled = False
                     self.stop_button.config(state=tk.DISABLED)
                     self.update_prompt()
+                    if self.stop_requested.is_set():
+                        self.print_prompt()
+                except:
+                    pass
+                self.stop_requested.clear()
 
         threading.Thread(target=target, daemon=True).start()
 
@@ -486,10 +662,13 @@ class TerminalTab:
     def close_tab(self):
         if self.process_running:
             self.stop_current_process()
-        self.on_close_callback(self)
+        self.output_text.after(50, lambda: self.on_close_callback(self))
 
     def focus(self):
-        self.input_entry.focus_set()
+        try:
+            self.input_entry.focus_set()
+        except:
+            pass
 
 
 class ToolTab:
@@ -498,58 +677,161 @@ class ToolTab:
         self.tool_name = tool_name
         self.on_close_callback = on_close_callback
 
+        self.current_process = None
+        self.process_running = False
+        self.process_lock = threading.Lock()
+        self.stop_requested = threading.Event()
+        self.is_closing = False
+        self.user_scrolled = False
+        self.scroll_check_after_id = None
+
         self.frame = ttk.Frame(notebook)
         self.tab_id = notebook.add(self.frame, text=f"🔧 {tool_name}")
 
         self.tool_configs = {
             "Nmap": {
-                "icon": "📡", "description": "Сканер сети",
+                "icon": "📡", "description": "Network Scanner",
+                "category": "Network",
                 "params": [
-                    {"name": "Цель", "key": "target", "default": "127.0.0.1"},
-                    {"name": "Порты", "key": "ports", "default": "1-1000"},
-                    {"name": "Опции", "key": "options", "default": "-sV"}
+                    {"name": "Target", "key": "target", "default": "127.0.0.1"},
+                    {"name": "Ports", "key": "ports", "default": "1-1000"},
+                    {"name": "Options", "key": "options", "default": "-sV"}
                 ],
                 "build_cmd": lambda p: f"nmap {p['options']} -p{p['ports']} {p['target']}"
             },
             "SQLMap": {
-                "icon": "💉", "description": "SQL-инъекции",
+                "icon": "💉", "description": "SQL Injection",
+                "category": "Exploitation",
                 "params": [
                     {"name": "URL", "key": "url", "default": "http://test.com?id=1"},
-                    {"name": "Опции", "key": "options", "default": "--dbs --batch"}
+                    {"name": "Options", "key": "options", "default": "--dbs --batch"}
                 ],
                 "build_cmd": lambda p: f"sqlmap -u '{p['url']}' {p['options']}"
             },
             "Netcat": {
-                "icon": "🎧", "description": "Сетевой инструмент",
+                "icon": "🎧", "description": "Network Tool",
+                "category": "Network",
                 "params": [
-                    {"name": "Режим", "key": "mode", "default": "listen"},
-                    {"name": "Порт", "key": "port", "default": "4444"},
-                    {"name": "Цель", "key": "target", "default": ""}
+                    {"name": "Mode", "key": "mode", "default": "listen"},
+                    {"name": "Port", "key": "port", "default": "4444"},
+                    {"name": "Target", "key": "target", "default": ""}
                 ],
                 "build_cmd": lambda p: f"nc -lvnp {p['port']}" if p['mode'] == 'listen' else f"nc {p['target']} {p['port']}"
             },
             "Hydra": {
-                "icon": "🐉", "description": "Брутфорс",
+                "icon": "🐉", "description": "Brute Force",
+                "category": "Exploitation",
                 "params": [
-                    {"name": "Цель", "key": "target", "default": "127.0.0.1"},
-                    {"name": "Сервис", "key": "service", "default": "ssh"},
-                    {"name": "Пользователь", "key": "user", "default": "root"},
-                    {"name": "Словарь", "key": "wordlist", "default": "/usr/share/wordlists/rockyou.txt"}
+                    {"name": "Target", "key": "target", "default": "127.0.0.1"},
+                    {"name": "Service", "key": "service", "default": "ssh"},
+                    {"name": "Username", "key": "user", "default": "root"},
+                    {"name": "Wordlist", "key": "wordlist", "default": "/usr/share/wordlists/rockyou.txt"}
                 ],
                 "build_cmd": lambda p: f"hydra -l {p['user']} -P {p['wordlist']} {p['target']} {p['service']}"
             },
             "Metasploit": {
-                "icon": "🎯", "description": "Генерация payload",
+                "icon": "🎯", "description": "Payload Generator",
+                "category": "Exploitation",
                 "params": [
                     {"name": "LHOST", "key": "lhost", "default": "192.168.1.100"},
                     {"name": "LPORT", "key": "lport", "default": "4444"},
-                    {"name": "Формат", "key": "format", "default": "exe"}
+                    {"name": "Format", "key": "format", "default": "exe"}
                 ],
                 "build_cmd": lambda p: f"msfvenom -p windows/meterpreter/reverse_tcp LHOST={p['lhost']} LPORT={p['lport']} -f {p['format']} -o payload.{p['format']}"
-            }
+            },
+            "theHarvester": {
+                "icon": "🌐", "description": "Email & Domain Harvester",
+                "category": "OSINT",
+                "params": [
+                    {"name": "Domain", "key": "domain", "default": "example.com"},
+                    {"name": "Sources", "key": "sources", "default": "google,bing,yahoo"},
+                    {"name": "Limit", "key": "limit", "default": "100"}
+                ],
+                "build_cmd": lambda p: f"theHarvester -d {p['domain']} -b {p['sources']} -l {p['limit']}"
+            },
+            "Sherlock": {
+                "icon": "🔍", "description": "Username Search",
+                "category": "OSINT",
+                "params": [
+                    {"name": "Username", "key": "username", "default": "username"},
+                    {"name": "Output", "key": "output", "default": ""},
+                    {"name": "Timeout", "key": "timeout", "default": "10"}
+                ],
+                "build_cmd": lambda p: f"sherlock {p['username']}" + 
+                    (f" --output {p['output']}" if p['output'] else "") + 
+                    f" --timeout {p['timeout']}"
+            },
+            "Whois": {
+                "icon": "📋", "description": "WHOIS Lookup",
+                "category": "OSINT",
+                "params": [
+                    {"name": "Domain/IP", "key": "target", "default": "example.com"},
+                    {"name": "Server", "key": "server", "default": ""}
+                ],
+                "build_cmd": lambda p: f"whois {p['target']}" + 
+                    (f" -h {p['server']}" if p['server'] else "")
+            },
+            "ExifTool": {
+                "icon": "📸", "description": "Metadata Extractor",
+                "category": "OSINT",
+                "params": [
+                    {"name": "File", "key": "file", "default": "image.jpg"},
+                    {"name": "Options", "key": "options", "default": "-a -u -g1"}
+                ],
+                "build_cmd": lambda p: f"exiftool {p['options']} {p['file']}"
+            },
+            "Photon": {
+                "icon": "🕷", "description": "Web Crawler",
+                "category": "OSINT",
+                "params": [
+                    {"name": "URL", "key": "url", "default": "https://example.com"},
+                    {"name": "Depth", "key": "depth", "default": "2"},
+                    {"name": "Timeout", "key": "timeout", "default": "5"}
+                ],
+                "build_cmd": lambda p: f"photon -u {p['url']} -l {p['depth']} -t {p['timeout']}"
+            },
+            "Holehe": {
+                "icon": "📧", "description": "Email Verifier",
+                "category": "OSINT",
+                "params": [
+                    {"name": "Email", "key": "email", "default": "test@example.com"},
+                    {"name": "Only Used", "key": "only_used", "default": ""}
+                ],
+                "build_cmd": lambda p: f"holehe {p['email']}" + 
+                    (" --only-used" if p['only_used'] else "")
+            },
+            "SpiderFoot": {
+                "icon": "🕸", "description": "Automated OSINT",
+                "category": "OSINT",
+                "params": [
+                    {"name": "Target", "key": "target", "default": "example.com"},
+                    {"name": "Type", "key": "type", "default": "DOMAIN_NAME"}
+                ],
+                "build_cmd": lambda p: f"spiderfoot -s {p['target']} -t {p['type']}"
+            },
+            "Dmitry": {
+                "icon": "🗺", "description": "Host Info Gatherer",
+                "category": "OSINT",
+                "params": [
+                    {"name": "Target", "key": "target", "default": "example.com"},
+                    {"name": "Options", "key": "options", "default": "-winsepfb"}
+                ],
+                "build_cmd": lambda p: f"dmitry {p['options']} {p['target']}"
+            },
+            "Metagoofil": {
+                "icon": "📑", "description": "Document Metadata",
+                "category": "OSINT",
+                "params": [
+                    {"name": "Domain", "key": "domain", "default": "example.com"},
+                    {"name": "File Types", "key": "file_types", "default": "pdf,doc,xls"},
+                    {"name": "Limit", "key": "limit", "default": "50"}
+                ],
+                "build_cmd": lambda p: f"metagoofil -d {p['domain']} -t {p['file_types']} -l {p['limit']} -o results -f results.html"
+            },
         }
 
         config = self.tool_configs.get(tool_name, {})
+        category = config.get('category', 'Other')
 
         top_frame = tk.Frame(self.frame, bg='#1A1A1A')
         top_frame.pack(fill=tk.X, pady=(0, 10))
@@ -559,8 +841,11 @@ class ToolTab:
 
         tk.Label(title_frame, text=f"{config.get('icon', '🔧')} {tool_name}",
                 bg='#1A1A1A', fg='#00FF00', font=('Arial', 16, 'bold')).pack()
-        tk.Label(title_frame, text=config.get('description', 'Инструмент'),
+        tk.Label(title_frame, text=config.get('description', 'Tool'),
                 bg='#1A1A1A', fg='#666666', font=('Arial', 10)).pack(pady=(5, 0))
+        tk.Label(title_frame, text=f"📂 Category: {category}",
+                bg='#1A1A1A', fg='#AA44FF' if category == 'OSINT' else '#44AAFF', 
+                font=('Arial', 9)).pack(pady=(2, 0))
 
         separator = tk.Frame(top_frame, bg='#2A2A2A', height=2)
         separator.pack(fill=tk.X, padx=20, pady=10)
@@ -590,7 +875,13 @@ class ToolTab:
                                     relief=tk.FLAT, padx=30, pady=8, cursor="hand2")
         self.run_button.pack(side=tk.LEFT, padx=5)
 
-        self.clear_button = tk.Button(button_frame, text="🗑️ CLEAR", command=self.clear_output,
+        self.stop_button = tk.Button(button_frame, text="⏹ STOP", command=self.stop_current_tool,
+                                     bg='#5A2A2A', fg='#FF4444', font=('Arial', 11, 'bold'),
+                                     relief=tk.FLAT, padx=25, pady=8, cursor="hand2",
+                                     state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+
+        self.clear_button = tk.Button(button_frame, text="🗑 CLEAR", command=self.clear_output,
                                      bg='#3A3A3A', fg='#AAAAAA', font=('Arial', 11),
                                      relief=tk.FLAT, padx=25, pady=8, cursor="hand2")
         self.clear_button.pack(side=tk.LEFT, padx=5)
@@ -610,7 +901,7 @@ class ToolTab:
         self.output_text = tk.Text(text_container, bg='#0C0C0C', fg='#00FF00',
                                    font=('Consolas', 10), wrap=tk.WORD,
                                    relief=tk.FLAT, padx=10, pady=10,
-                                   yscrollcommand=v_scroll.set)
+                                   yscrollcommand=self.on_scroll)
         self.output_text.pack(fill=tk.BOTH, expand=True)
         v_scroll.config(command=self.output_text.yview)
 
@@ -618,8 +909,63 @@ class ToolTab:
         self.output_text.tag_configure('error', foreground='#FF4444')
         self.output_text.tag_configure('success', foreground='#44FF44')
         self.output_text.tag_configure('prompt', foreground='#44AAFF')
+        self.output_text.tag_configure('warning', foreground='#FFAA44')
+        self.output_text.tag_configure('osint', foreground='#AA44FF')
+
+        self.output_text.bind('<Button-4>', self.on_mousewheel_up)
+        self.output_text.bind('<Button-5>', self.on_mousewheel_down)
+        self.output_text.bind('<Button-1>', self.on_user_click)
+        self.output_text.bind('<Key>', self.on_user_key)
 
         self.add_output(f"✅ {tool_name} ready\n", 'success')
+        self.add_output(f"💡 STOP to terminate process\n", 'info')
+
+    def on_scroll(self, *args):
+        self.output_text.yview_moveto(args[0])
+        self.check_user_scroll()
+
+    def on_mousewheel_up(self, event):
+        self.user_scrolled = True
+        self.cancel_scroll_check()
+
+    def on_mousewheel_down(self, event):
+        self.output_text.yview_scroll(1, "units")
+        self.check_user_scroll()
+
+    def on_user_click(self, event):
+        self.schedule_scroll_check()
+
+    def on_user_key(self, event):
+        if event.keysym in ('Up', 'Down', 'Prior', 'Next', 'Home', 'End'):
+            self.user_scrolled = True
+            self.cancel_scroll_check()
+        else:
+            self.schedule_scroll_check()
+
+    def schedule_scroll_check(self):
+        if self.scroll_check_after_id:
+            self.output_text.after_cancel(self.scroll_check_after_id)
+        self.scroll_check_after_id = self.output_text.after(100, self.check_user_scroll)
+
+    def cancel_scroll_check(self):
+        if self.scroll_check_after_id:
+            self.output_text.after_cancel(self.scroll_check_after_id)
+            self.scroll_check_after_id = None
+
+    def check_user_scroll(self):
+        if not self.process_running:
+            self.user_scrolled = False
+            return
+
+        try:
+            yview = self.output_text.yview()
+            bottom_pos = yview[1]
+            if bottom_pos >= 0.99:
+                self.user_scrolled = False
+            else:
+                self.user_scrolled = True
+        except:
+            self.user_scrolled = False
 
     def get_params(self):
         params = {}
@@ -627,7 +973,74 @@ class ToolTab:
             params[key] = entry.get().strip()
         return params
 
+    def stop_current_tool(self):
+        with self.process_lock:
+            if not self.process_running or self.current_process is None:
+                return
+            self.stop_requested.set()
+            process = self.current_process
+            self.process_running = False
+
+        if process is None:
+            return
+
+        self.add_output(f"\n^C\n", 'prompt')
+
+        def kill_process():
+            try:
+                pid = process.pid
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGINT)
+                except:
+                    try:
+                        os.kill(pid, signal.SIGINT)
+                    except:
+                        pass
+
+                time.sleep(0.3)
+                if process.poll() is not None:
+                    self.add_output("✅ Process terminated\n", 'success')
+                    return
+
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except:
+                        pass
+
+                self.add_output("✅ Process killed\n", 'success')
+            except:
+                pass
+            finally:
+                def cleanup():
+                    try:
+                        with self.process_lock:
+                            self.current_process = None
+                        self.user_scrolled = False
+                        self.stop_button.config(state=tk.DISABLED)
+                        self.run_button.config(state=tk.NORMAL)
+                    except:
+                        pass
+                try:
+                    self.output_text.after(0, cleanup)
+                except:
+                    pass
+
+        threading.Thread(target=kill_process, daemon=True).start()
+
+        try:
+            self.stop_button.config(state=tk.DISABLED)
+            self.run_button.config(state=tk.NORMAL)
+        except:
+            pass
+
     def run_tool(self):
+        if self.process_running:
+            self.add_output("⚠️ Tool is already running\n", 'warning')
+            return
+
         params = self.get_params()
         config = self.tool_configs.get(self.tool_name, {})
         if not config:
@@ -637,53 +1050,117 @@ class ToolTab:
         if not cmd:
             self.add_output("❌ Invalid params\n", 'error')
             return
+
         self.add_output(f"\n{'='*60}\n", 'prompt')
         self.add_output(f"🔧 {self.tool_name}\n", 'prompt')
         self.add_output(f"📁 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n", 'prompt')
         self.add_output(f"$ {cmd}\n", 'prompt')
         self.add_output(f"{'='*60}\n", 'prompt')
 
+        self.stop_requested.clear()
+
         def target():
+            process = None
             try:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
-                if result.stdout:
-                    self.add_output(result.stdout)
-                if result.stderr:
-                    self.add_output(result.stderr, 'error')
-                self.add_output(f"\n✅ Done (code: {result.returncode})\n", 'success')
-            except subprocess.TimeoutExpired:
-                self.add_output("❌ Timeout 120s\n", 'error')
+                with self.process_lock:
+                    if self.stop_requested.is_set():
+                        return
+                    
+                    process = subprocess.Popen(
+                        cmd, shell=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1,
+                        preexec_fn=os.setsid
+                    )
+                    self.current_process = process
+                    self.process_running = True
+                    self.run_button.config(state=tk.DISABLED)
+                    self.stop_button.config(state=tk.NORMAL)
+
+                while process.poll() is None and not self.stop_requested.is_set():
+                    try:
+                        rlist, _, _ = select.select([process.stdout], [], [], 0.1)
+                        if rlist:
+                            data = process.stdout.read(4096)
+                            if data:
+                                self.add_output(data)
+                    except:
+                        break
+
+                if self.stop_requested.is_set():
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except:
+                        try:
+                            process.kill()
+                        except:
+                            pass
+                    process.wait()
+                else:
+                    returncode = process.wait()
+                    self.add_output(f"\n✅ Completed (code: {returncode})\n", 'success')
+
             except Exception as e:
-                self.add_output(f"❌ {e}\n", 'error')
+                if not self.stop_requested.is_set():
+                    self.add_output(f"\n❌ Error: {e}\n", 'error')
+            finally:
+                with self.process_lock:
+                    self.current_process = None
+                    self.process_running = False
+                try:
+                    self.user_scrolled = False
+                    self.run_button.config(state=tk.NORMAL)
+                    self.stop_button.config(state=tk.DISABLED)
+                except:
+                    pass
+                self.stop_requested.clear()
 
         threading.Thread(target=target, daemon=True).start()
 
     def clear_output(self):
-        self.output_text.config(state=tk.NORMAL)
-        self.output_text.delete(1.0, tk.END)
-        self.output_text.config(state=tk.DISABLED)
-        self.add_output("✨ Cleared\n", 'success')
+        try:
+            self.output_text.config(state=tk.NORMAL)
+            self.output_text.delete(1.0, tk.END)
+            self.output_text.config(state=tk.DISABLED)
+            self.user_scrolled = False
+            self.add_output("✨ Cleared\n", 'success')
+        except:
+            pass
 
     def add_output(self, text, tag=None):
         def _add():
-            self.output_text.config(state=tk.NORMAL)
-            self.output_text.insert(tk.END, text, tag)
-            self.output_text.see(tk.END)
-            self.output_text.config(state=tk.DISABLED)
+            try:
+                if not self.output_text.winfo_exists():
+                    return
+                self.output_text.config(state=tk.NORMAL)
+                self.output_text.insert(tk.END, text, tag)
+                
+                if not self.user_scrolled:
+                    self.output_text.see(tk.END)
+                    
+                self.output_text.config(state=tk.DISABLED)
+            except:
+                pass
 
-        if threading.current_thread() != threading.main_thread():
-            self.output_text.after(0, _add)
-        else:
+        if threading.current_thread() is threading.main_thread():
             _add()
+        else:
+            try:
+                if self.output_text.winfo_exists():
+                    self.output_text.after(0, _add)
+            except:
+                pass
 
     def close_tab(self):
-        self.on_close_callback(self)
+        if self.process_running:
+            self.stop_current_tool()
+        self.output_text.after(50, lambda: self.on_close_callback(self))
 
 
 class CyberTerminalApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CyberTerm v5.2 - Professional Terminal")
+        self.root.title("CyberTerm v6.0 - Professional Terminal")
         self.root.geometry("1400x900")
         self.root.minsize(1000, 600)
         self.root.configure(bg='#0C0C0C')
@@ -691,8 +1168,10 @@ class CyberTerminalApp:
         style = ttk.Style()
         style.theme_use('clam')
         style.configure('TNotebook', background='#0C0C0C', borderwidth=0)
-        style.configure('TNotebook.Tab', background='#1A1A1A', foreground='#00FF00', padding=[15, 8], font=('Arial', 10))
-        style.map('TNotebook.Tab', background=[('selected', '#2A2A2A')], foreground=[('selected', '#44FF44')])
+        style.configure('TNotebook.Tab', background='#1A1A1A', foreground='#00FF00', 
+                       padding=[15, 8], font=('Arial', 10))
+        style.map('TNotebook.Tab', background=[('selected', '#2A2A2A')], 
+                 foreground=[('selected', '#44FF44')])
 
         top_bar = tk.Frame(root, bg='#0C0C0C', height=50)
         top_bar.pack(fill=tk.X, padx=10, pady=(10, 5))
@@ -701,25 +1180,32 @@ class CyberTerminalApp:
         logo_frame = tk.Frame(top_bar, bg='#0C0C0C')
         logo_frame.pack(side=tk.LEFT)
 
-        tk.Label(logo_frame, text="🔥", bg='#0C0C0C', fg='#FF4444', font=('Arial', 18)).pack(side=tk.LEFT)
-        tk.Label(logo_frame, text=" CyberTerm v5.2", bg='#0C0C0C', fg='#00FF00', font=('Arial', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 0))
-        tk.Label(logo_frame, text=" | Professional", bg='#0C0C0C', fg='#666666', font=('Arial', 10)).pack(side=tk.LEFT)
+        tk.Label(logo_frame, text="🔥", bg='#0C0C0C', fg='#FF4444', 
+                font=('Arial', 18)).pack(side=tk.LEFT)
+        tk.Label(logo_frame, text=" CyberTerm v6.0", bg='#0C0C0C', fg='#00FF00', 
+                font=('Arial', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 0))
+        tk.Label(logo_frame, text=" | Professional Terminal", bg='#0C0C0C', 
+                fg='#AA44FF', font=('Arial', 10)).pack(side=tk.LEFT)
 
         button_frame = tk.Frame(top_bar, bg='#0C0C0C')
         button_frame.pack(side=tk.RIGHT)
 
-        self.new_terminal_button = tk.Button(button_frame, text="+ New Terminal", command=self.add_terminal_tab,
+        self.new_terminal_button = tk.Button(button_frame, text="+ New Terminal", 
+                                            command=self.add_terminal_tab,
                                             bg='#1A1A1A', fg='#00FF00', font=('Arial', 10),
                                             relief=tk.FLAT, padx=15, pady=5, cursor="hand2")
         self.new_terminal_button.pack(side=tk.LEFT, padx=5)
 
-        self.new_tool_button = tk.Button(button_frame, text="+ Tool", command=self.add_tool_tab_dialog,
+        self.new_tool_button = tk.Button(button_frame, text="+ Tool", 
+                                        command=self.add_tool_tab_dialog,
                                         bg='#1A1A1A', fg='#44AAFF', font=('Arial', 10),
                                         relief=tk.FLAT, padx=15, pady=5, cursor="hand2")
         self.new_tool_button.pack(side=tk.LEFT, padx=5)
 
-        self.status_bar = tk.Label(root, text=f"✅ Ready | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                                   bg='#1A1A1A', fg='#666666', anchor='w', padx=10, font=('Arial', 9))
+        self.status_bar = tk.Label(root, 
+                                  text=f"✅ Ready | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                                  bg='#1A1A1A', fg='#666666', anchor='w', padx=10, 
+                                  font=('Arial', 9))
         self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
         self.notebook = ttk.Notebook(root)
@@ -730,7 +1216,10 @@ class CyberTerminalApp:
         self.tab_counter = 1
 
         self.add_terminal_tab("Shell")
-        for tool in ["Nmap", "SQLMap", "Netcat", "Hydra", "Metasploit"]:
+        
+        for tool in ["Nmap", "Netcat", "SQLMap", "Hydra", "Metasploit",
+                     "theHarvester", "Sherlock", "Whois", "ExifTool", "Photon",
+                     "Holehe", "SpiderFoot", "Dmitry", "Metagoofil"]:
             self.add_tool_tab(tool)
 
         self.notebook.bind('<Button-3>', self.on_tab_right_click)
@@ -746,24 +1235,36 @@ class CyberTerminalApp:
             if tab_index >= 0:
                 tab_text = self.notebook.tab(tab_index, "text")
                 menu = tk.Menu(self.root, tearoff=0, bg='#1A1A1A', fg='#00FF00')
-                menu.add_command(label=f"Close {tab_text}", command=lambda: self.close_tab(tab_index))
+                menu.add_command(label=f"Close {tab_text}", 
+                               command=lambda: self.close_tab(tab_index))
                 menu.post(event.x_root, event.y_root)
         except:
             pass
 
     def close_tab(self, tab_index):
         if tab_index >= 0:
-            if tab_index < len(self.terminal_tabs):
-                self.terminal_tabs[tab_index].close_tab()
-            elif tab_index - len(self.terminal_tabs) < len(self.tool_tabs):
-                tool_index = tab_index - len(self.terminal_tabs)
-                if tool_index < len(self.tool_tabs):
-                    self.tool_tabs[tool_index].close_tab()
-            else:
-                self.notebook.forget(tab_index)
+            try:
+                if tab_index < len(self.terminal_tabs):
+                    self.terminal_tabs[tab_index].close_tab()
+                else:
+                    tool_index = tab_index - len(self.terminal_tabs)
+                    if tool_index < len(self.tool_tabs):
+                        self.tool_tabs[tool_index].close_tab()
+            except:
+                try:
+                    self.notebook.forget(tab_index)
+                except:
+                    pass
 
     def update_status_time(self):
-        self.status_bar.config(text=f"✅ Ready | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        try:
+            self.status_bar.config(
+                text=f"✅ Ready | Terminals: {len(self.terminal_tabs)} | "
+                     f"Tools: {len(self.tool_tabs)} | "
+                     f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        except:
+            pass
         self.root.after(1000, self.update_status_time)
 
     def on_tab_closed(self, tab):
@@ -792,48 +1293,111 @@ class CyberTerminalApp:
             name = f"Shell{self.tab_counter}"
         tab = TerminalTab(self.notebook, name, self.on_tab_closed, self.status_bar)
         self.terminal_tabs.append(tab)
-        self.status_bar.config(text=f"✅ Terminal created: {name}")
         return tab
 
     def add_tool_tab(self, tool_name):
         tab = ToolTab(self.notebook, tool_name, self.on_tool_closed)
         self.tool_tabs.append(tab)
-        self.status_bar.config(text=f"✅ Tool added: {tool_name}")
         return tab
 
     def add_tool_tab_dialog(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("Add Tool")
-        dialog.geometry("400x350")
+        dialog.geometry("450x550")
         dialog.configure(bg='#1A1A1A')
         dialog.transient(self.root)
         dialog.grab_set()
 
-        tk.Label(dialog, text="Choose tool:", bg='#1A1A1A', fg='#00FF00', font=('Arial', 14, 'bold')).pack(pady=20)
+        tk.Label(dialog, text="🔧 Select Tool:", bg='#1A1A1A', 
+                fg='#00FF00', font=('Arial', 14, 'bold')).pack(pady=20)
 
-        tools_frame = tk.Frame(dialog, bg='#1A1A1A')
-        tools_frame.pack(fill=tk.BOTH, expand=True, padx=20)
+        container = tk.Frame(dialog, bg='#1A1A1A')
+        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 10))
 
-        for tool in ["Nmap", "SQLMap", "Netcat", "Hydra", "Metasploit"]:
-            btn = tk.Button(tools_frame, text=f"🔧 {tool}", command=lambda t=tool: self._add_tool_from_dialog(dialog, t),
-                           bg='#2A2A2A', fg='#00FF00', font=('Arial', 11),
-                           relief=tk.FLAT, pady=8, cursor="hand2")
-            btn.pack(fill=tk.X, pady=5)
+        v_scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL)
+        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        tk.Button(tools_frame, text="Cancel", command=dialog.destroy,
+        canvas = tk.Canvas(container, bg='#1A1A1A', highlightthickness=0,
+                          yscrollcommand=v_scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        v_scrollbar.config(command=canvas.yview)
+
+        scrollable_frame = tk.Frame(canvas, bg='#1A1A1A')
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas_frame = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+        def on_canvas_configure(event):
+            canvas.itemconfig(canvas_frame, width=event.width)
+        
+        canvas.bind('<Configure>', on_canvas_configure)
+
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        canvas.bind_all("<MouseWheel>", on_mousewheel)
+        dialog.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        categories = {
+            "🌐 NETWORK": ["Nmap", "Netcat"],
+            "💥 EXPLOITATION": ["SQLMap", "Hydra", "Metasploit"],
+            "🔍 OSINT": ["theHarvester", "Sherlock", "Whois", "ExifTool", 
+                        "Photon", "Holehe", "SpiderFoot", "Dmitry", "Metagoofil"]
+        }
+
+        icons = {
+            "Nmap": "📡", "Netcat": "🎧", "SQLMap": "💉", "Hydra": "🐉",
+            "Metasploit": "🎯", "theHarvester": "🌐", "Sherlock": "🔍",
+            "Whois": "📋", "ExifTool": "📸", "Photon": "🕷",
+            "Holehe": "📧", "SpiderFoot": "🕸", "Dmitry": "🗺", "Metagoofil": "📑"
+        }
+
+        for category, tools in categories.items():
+            cat_frame = tk.Frame(scrollable_frame, bg='#1A1A1A')
+            cat_frame.pack(fill=tk.X, pady=(10, 5))
+
+            cat_color = '#AA44FF' if 'OSINT' in category else '#44AAFF'
+            tk.Label(cat_frame, text=category, bg='#1A1A1A', 
+                    fg=cat_color, font=('Arial', 12, 'bold')).pack(anchor='w')
+
+            separator = tk.Frame(scrollable_frame, bg='#2A2A2A', height=1)
+            separator.pack(fill=tk.X, pady=5)
+
+            for tool in tools:
+                btn = tk.Button(
+                    scrollable_frame,
+                    text=f"  {icons.get(tool, '🔧')}  {tool}",
+                    command=lambda t=tool: self._add_tool_from_dialog(dialog, t),
+                    bg='#2A2A2A', fg='#00FF00', font=('Arial', 10),
+                    relief=tk.FLAT, pady=10, padx=15, cursor="hand2",
+                    anchor='w', justify='left'
+                )
+                btn.pack(fill=tk.X, pady=3)
+
+        tk.Button(dialog, text="✗ Cancel", command=dialog.destroy,
                  bg='#3A3A3A', fg='#AAAAAA', font=('Arial', 10),
-                 relief=tk.FLAT, pady=5, cursor="hand2").pack(pady=10)
+                 relief=tk.FLAT, pady=8, cursor="hand2").pack(pady=10)
 
     def _add_tool_from_dialog(self, dialog, tool_name):
         dialog.destroy()
         self.add_tool_tab(tool_name)
 
     def on_closing(self):
-        for tab in self.terminal_tabs:
+        for tab in self.terminal_tabs + self.tool_tabs:
             if tab.process_running:
-                tab.stop_current_process()
+                if isinstance(tab, TerminalTab):
+                    tab.stop_current_process()
+                else:
+                    tab.stop_current_tool()
 
-        if messagebox.askokcancel("Exit", "Close CyberTerm?"):
+        self.root.after(100, lambda: self._really_close())
+
+    def _really_close(self):
+        if messagebox.askokcancel("Exit", "Close CyberTerm v6.0?"):
             self.root.quit()
             self.root.destroy()
 
